@@ -1,0 +1,36 @@
+version: '3.8'
+
+services:
+  # -------------------------------------------------------------
+  # 1. Agent Webhook: Real-time WhatsApp Chat & Gemini Assistant
+  # -------------------------------------------------------------
+  agent-webhook:
+    build: .
+    container_name: ai-agent-webhook
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./.env:/app/.env
+      - ./token.json:/app/token.json
+      - ./credentials.json:/app/credentials.json
+    environment:
+      - PORT=8000
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # -------------------------------------------------------------
+  # 2. Agent Scheduler: Automated Gmail Polling & Daily Summaries
+  # -------------------------------------------------------------
+  agent-scheduler:
+    build: .
+    container_name: ai-agent-scheduler
+    restart: unless-stopped
+    volumes:
+      - ./.env:/app/.env
+      - ./token.json:/app/token.json
+      - ./credentials.json:/app/credentials.json
+    command: ["python", "main.py", "--schedule"]
