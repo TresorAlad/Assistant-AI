@@ -3,8 +3,10 @@ whatsapp_sender.py - Module d'envoi WhatsApp via Evolution API
 """
 
 import os
+from typing import Any
 import requests
 from dotenv import load_dotenv
+
 
 load_dotenv()
 
@@ -58,7 +60,7 @@ def check_connection() -> bool:
         return False
 
 
-def send_message(message: str, phone: str = None) -> bool:
+def send_message(message: str, phone: str = None) -> Any:
     _validate_config()
     target = phone or PHONE_NUMBER
     cleaned_phone = _format_phone(target)
@@ -77,7 +79,15 @@ def send_message(message: str, phone: str = None) -> bool:
         resp = requests.post(url, headers=headers, json=payload, timeout=30)
         resp.raise_for_status()
         print(f"[SEND OK]")
-        return True
+        
+        # Extraire et retourner l'identifiant du message envoyé
+        try:
+            data = resp.json()
+            key_id = data.get("key", {}).get("id") or data.get("response", {}).get("key", {}).get("id")
+            return key_id or True
+        except Exception:
+            return True
+            
     except requests.exceptions.Timeout:
         print("Erreur: Timeout - Evolution API ne repond pas.")
     except requests.exceptions.ConnectionError:
@@ -87,6 +97,7 @@ def send_message(message: str, phone: str = None) -> bool:
     except Exception as e:
         print(f"Erreur inattendue send_message: {e}")
     return False
+
 
 
 def send_summary(summary: str) -> bool:

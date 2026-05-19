@@ -1,10 +1,5 @@
 """
 agent.py - Moteur d'assistant IA personnel (WhatsApp / Gmail)
-
-Architecture :
-- Le modele produit une decision structuree (reply | escalation | action)
-- Le backend execute les actions via les APIs reelles
-- Jamais de confirmation d'action sans resultat API
 """
 
 import json
@@ -13,97 +8,36 @@ import re
 import contextvars
 from typing import Any, Literal, Optional
 
-from google import genai
-from google.genai import types
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 
 from gmail_reader import send_email, fetch_emails
+from llm_provider import AgentQuotaError, AllProvidersExhausted, create_chat_session
+from prompts import ASSISTANT_CLIENT_PROMPT, ASSISTANT_OWNER_PROMPT
 from whatsapp_sender import send_message
 
 load_dotenv()
 
 active_client_chat_id = contextvars.ContextVar("active_client_chat_id", default="")
 
-gemini_api_key = os.getenv("GEMINI_API_KEY")
-if not gemini_api_key:
-    print("ATTENTION: GEMINI_API_KEY non trouvee dans .env")
-    gemini_api_key = "DUMMY_KEY"
-
-client = genai.Client(api_key=gemini_api_key)
-
-MODEL_NAME = "gemini-2.5-flash"
-
 SENSITIVE_KEYWORDS = (
-    "mot de passe",
-    "password",
-    "code secret",
-    "rib",
-    "iban",
-    "carte bancaire",
-    "cvv",
-    "pin",
-    "compte bancaire",
-    "virement",
-    "credentials",
-    "token",
-    "api key",
+    "mot de passe", "password", "code secret", "rib", "iban",
+    "carte bancaire", "cvv", "pin", "compte bancaire", "virement",
+    "credentials", "token", "api key",
 )
 
 CONTACTS_DB = {
     "koffi": {"email": "koffi@example.com", "phone": "+22800000001"},
     "jean": {"email": "jean@example.com", "phone": "+22800000002"},
-    "esgis ia": {"email": "esgis.ia@example.com", "phone": "123456789@g.us"},
 }
 
 
 class AgentDecision(BaseModel):
-    type: Literal["reply", "escalation", "action"]
+    type: Literal["reply", "escalation", "action", "skip"]
     message: str = ""
     service: Optional[Literal["whatsapp", "gmail", "other"]] = None
     task: Optional[str] = None
     data: dict[str, Any] = Field(default_factory=dict)
-
-
-SYSTEM_INSTRUCTION_CORE = """
-Tu es un assistant personnel intelligent et chaleureux intégré à WhatsApp et aux e-mails.
-Tu réponds TOUJOURS en français, de manière concise, naturelle et fluide. Évite le ton trop rigide ou robotique.
-
-Règles :
-1. Lis le message entrant (texte ou note vocale transcrite, préfixée [Message vocal]).
-2. Identifie l'intention : discussion amicale, question générale, demande de tâche, urgence.
-3. Rends-toi utile ! Réponds de manière autonome (type "reply") à toutes les questions générales, salutations, bavardages ou questions courantes sur ton propriétaire (ex: "il va bien", "que fait-il ?"). Réponds avec bienveillance.
-4. N'escalade (type "escalation") que dans ces cas STRICTS :
-   - Le correspondant demande EXPRESSÉMENT à parler ou laisser un message au propriétaire (ex: "transmets-lui", "je veux lui parler", "dis-lui").
-   - Demande de données sensibles ou hautement confidentielles (mots de passe, comptes, codes secrets, coordonnées bancaires).
-   - Demande d'action ou de rendez-vous complexe nécessitant l'accord direct du propriétaire.
-5. Propose une action (type "action") uniquement pour les tâches exécutables via API (comme envoyer un email ou chercher un contact).
-6. Ne prétends JAMAIS qu'une action est faite : le système l'exécutera et confirmera.
-
-Format de sortie JSON strict (un seul objet) :
-- "reply" : réponse directe et naturelle au correspondant (champ "message" obligatoire)
-- "escalation" : résumé clair de la situation + ce dont le propriétaire a besoin ("message")
-- "action" : champs "service" (whatsapp|gmail|other), "task", "data", et "message" (accusé de réception court)
-"""
-
-SYSTEM_INSTRUCTION_OWNER = (
-    SYSTEM_INSTRUCTION_CORE
-    + """
-Contexte : canal privé avec ton propriétaire (Trésor).
-Tu as un accès complet à ses actions (Gmail, WhatsApp, etc.). Exécute ses ordres avec diligence.
-"""
-)
-
-SYSTEM_INSTRUCTION_CLIENT = (
-    SYSTEM_INSTRUCTION_CORE
-    + """
-Contexte : canal avec un client, un ami ou un contact externe de ton propriétaire.
-Tu n'as PAS accès aux emails privés ni aux outils personnels du propriétaire.
-- Sois très autonome et amical. Si on te demande "il va bien ?", réponds chaleureusement et directement (ex: "Oui, il va super bien ! Et vous, comment allez-vous ? En quoi puis-je vous aider ?") au lieu de dire que tu transmets la demande.
-- Si le correspondant demande à lui parler ou à lui laisser un message, utilise "escalation" pour notifier ton propriétaire proprement.
-- N'utilise JAMAIS "action" avec le service gmail pour les contacts externes.
-"""
-)
 
 
 def _contains_sensitive_text(text: str) -> bool:
@@ -124,42 +58,13 @@ def _parse_decision(raw: str) -> AgentDecision:
 
 
 def get_agent_chat(is_owner: bool = False):
-    instruction = SYSTEM_INSTRUCTION_OWNER if is_owner else SYSTEM_INSTRUCTION_CLIENT
-    
-    # Extraire le schéma Pydantic brut sous forme de dictionnaire
-    raw_schema = AgentDecision.model_json_schema()
-    
-    # Nettoyer récursivement le champ additionalProperties pour le SDK Gemini
-    def strip_additional_properties(d):
-        if isinstance(d, dict):
-            d.pop("additionalProperties", None)
-            for k, v in d.items():
-                strip_additional_properties(v)
-        elif isinstance(d, list):
-            for item in d:
-                strip_additional_properties(item)
-                
-    strip_additional_properties(raw_schema)
-
-    config = types.GenerateContentConfig(
-        system_instruction=instruction,
-        response_mime_type="application/json",
-        response_schema=raw_schema,
-    )
-    return client.chats.create(model=MODEL_NAME, config=config)
+    instruction = ASSISTANT_OWNER_PROMPT if is_owner else ASSISTANT_CLIENT_PROMPT
+    return create_chat_session(instruction, AgentDecision.model_json_schema())
 
 
-
-def _get_decision(chat, user_text: str) -> AgentDecision:
-    response = chat.send_message(user_text)
-    if response.parsed:
-        return AgentDecision.model_validate(response.parsed)
-    if response.text:
-        return _parse_decision(response.text)
-    return AgentDecision(
-        type="reply",
-        message="Desole, je n'ai pas pu formuler de reponse.",
-    )
+def _get_decision(chat, user_text: str, chat_id: str) -> AgentDecision:
+    raw = chat.send_message(user_text, chat_id=chat_id)
+    return _parse_decision(raw)
 
 
 def _search_contact(name: str) -> str:
@@ -177,7 +82,6 @@ def _notify_owner_escalation(client_chat_id: str, summary: str) -> bool:
     owner_phone = os.getenv("OWNER_PHONE", "").strip()
     if not owner_phone:
         return False
-
     client_display = client_chat_id.replace("@c.us", "").replace("@s.whatsapp.net", "")
     owner_message = (
         "--- ESCALADE ASSISTANT ---\n"
@@ -208,24 +112,17 @@ def _execute_action(decision: AgentDecision, chat_id: str, is_owner: bool) -> tu
             if not to or not subject:
                 return False, "Parametres email incomplets (to, subject requis)."
             ok = send_email(to, subject, body)
-            if ok:
-                return True, f"Email envoye a {to}."
-            return False, f"Echec d'envoi de l'email a {to}."
-
+            return (True, f"Email envoye a {to}.") if ok else (False, f"Echec d'envoi a {to}.")
         if task == "read_emails":
             max_results = int(data.get("max_results", 5))
             emails = fetch_emails(max_results=max_results)
             if not emails:
                 return True, "Aucun nouvel email dans la boite de reception."
-            lines = []
-            for i, email in enumerate(emails, 1):
-                lines.append(
-                    f"Email {i} :\nDe : {email.get('from')}\n"
-                    f"Sujet : {email.get('subject')}\n"
-                    f"Extrait : {email.get('snippet')}\n"
-                )
+            lines = [
+                f"Email {i} :\nDe : {e.get('from')}\nSujet : {e.get('subject')}\nExtrait : {e.get('snippet')}\n"
+                for i, e in enumerate(emails, 1)
+            ]
             return True, "\n".join(lines)
-
         return False, f"Tache Gmail inconnue : {task}"
 
     if service == "whatsapp":
@@ -235,11 +132,7 @@ def _execute_action(decision: AgentDecision, chat_id: str, is_owner: bool) -> tu
                 return False, "Message WhatsApp vide."
             phone = str(data.get("phone", "")).strip() or None
             ok = send_message(message, phone=phone)
-            if ok:
-                target = phone or "destinataire principal"
-                return True, f"Message WhatsApp envoye ({target})."
-            return False, "Echec d'envoi du message WhatsApp."
-
+            return (True, f"Message WhatsApp envoye.") if ok else (False, "Echec d'envoi WhatsApp.")
         return False, f"Tache WhatsApp inconnue : {task}"
 
     if service == "other" and task == "search_contact":
@@ -251,12 +144,10 @@ def _execute_action(decision: AgentDecision, chat_id: str, is_owner: bool) -> tu
     return False, f"Action non supportee : {service}/{task}"
 
 
-def route_decision(
-    decision: AgentDecision,
-    chat_id: str,
-    is_owner: bool,
-) -> str:
-    """Applique la decision et retourne le message a envoyer au correspondant."""
+def route_decision(decision: AgentDecision, chat_id: str, is_owner: bool) -> str:
+    if decision.type == "skip":
+        return ""
+
     if decision.type == "reply":
         return decision.message.strip() or "Message recu."
 
@@ -267,40 +158,30 @@ def route_decision(
         notified = _notify_owner_escalation(chat_id, summary)
         if notified:
             return (
-                "Merci pour votre message. Je transmets votre demande a mon proprietaire "
-                "et je reviens vers vous des que possible."
+                "Merci, je transmets a mon proprietaire et je reviens vers vous des que possible."
             )
-        return (
-            "Votre demande a ete enregistree. Je ne peux pas y repondre immediatement, "
-            "mais elle sera traitee prochainement."
-        )
+        return "Votre demande est notee, il vous recontactera prochainement."
 
     if decision.type == "action":
         ok, result = _execute_action(decision, chat_id, is_owner)
         ack = decision.message.strip()
         if ok:
-            if ack:
-                return f"{ack}\n\n{result}"
-            return result
+            return f"{ack}\n\n{result}" if ack else result
         if is_owner:
             return f"Je n'ai pas pu executer l'action : {result}"
-        return "Desole, je ne peux pas effectuer cette action pour le moment."
+        return "Desole, je ne peux pas faire ca pour le moment."
 
     return "Je n'ai pas compris votre demande."
 
 
 def handle_message(chat, user_text: str, chat_id: str, is_owner: bool) -> str:
-    """Analyse le message, route la decision, retourne la reponse utilisateur."""
     token = active_client_chat_id.set(chat_id)
     try:
-        decision = _get_decision(chat, user_text)
+        decision = _get_decision(chat, user_text, chat_id)
         if not is_owner and decision.type == "action" and decision.service == "gmail":
             decision = AgentDecision(
                 type="escalation",
-                message=(
-                    f"Le client {chat_id.replace('@c.us', '').replace('@s.whatsapp.net', '')} demande une action email : "
-                    f"{decision.task}. Message : {user_text[:200]}"
-                ),
+                message=f"Demande email client : {decision.task}. Msg : {user_text[:200]}",
             )
         return route_decision(decision, chat_id, is_owner)
     finally:
@@ -308,11 +189,10 @@ def handle_message(chat, user_text: str, chat_id: str, is_owner: bool) -> str:
 
 
 def ask_agent(chat, user_text: str) -> str:
-    """Compatibilite : traite comme proprietaire si contexte inconnu."""
     chat_id = active_client_chat_id.get() or os.getenv("OWNER_PHONE", "")
     is_owner = True
     owner_chat = os.getenv("OWNER_PHONE", "").strip().replace("+", "").replace(" ", "")
-    if owner_chat and "@c.us" not in owner_chat and "@s.whatsapp.net" not in owner_chat:
+    if owner_chat and "@s.whatsapp.net" not in owner_chat:
         owner_chat = f"{owner_chat}@s.whatsapp.net"
     if chat_id and owner_chat:
         is_owner = chat_id == owner_chat
@@ -324,25 +204,21 @@ def run_agent_cli():
     print("Assistant Personnel - Mode proprietaire")
     print("Tapez 'exit' pour quitter.")
     print("=" * 50)
-
     owner_phone = os.getenv("OWNER_PHONE", "owner-cli")
     chat = get_agent_chat(is_owner=True)
-
     while True:
         try:
             user_input = input("\nProprietaire : ").strip()
-            if user_input.lower() in ["exit", "quit"]:
+            if user_input.lower() in ("exit", "quit"):
                 break
             if not user_input:
                 continue
-            print("Assistant en cours...")
             reply = handle_message(chat, user_input, owner_phone, is_owner=True)
             print(f"\nAssistant : {reply}")
+        except (AgentQuotaError, AllProvidersExhausted) as e:
+            print(f"\n{e}")
         except KeyboardInterrupt:
-            print("\nArret.")
             break
-        except Exception as e:
-            print(f"\nErreur : {e}")
 
 
 if __name__ == "__main__":

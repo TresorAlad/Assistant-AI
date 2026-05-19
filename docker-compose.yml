@@ -17,6 +17,7 @@ services:
     environment:
       - PORT=8000
       - EVOLUTION_API_URL=http://evolution-api:8080
+      - PYTHONUNBUFFERED=1
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/"]
       interval: 30s
@@ -38,6 +39,7 @@ services:
       - ./credentials.json:/app/credentials.json
     environment:
       - EVOLUTION_API_URL=http://evolution-api:8080
+      - PYTHONUNBUFFERED=1
     command: ["python", "main.py", "--schedule"]
     depends_on:
       - evolution-api
