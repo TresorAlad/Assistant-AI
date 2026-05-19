@@ -1,11 +1,11 @@
 """
-audio_transcriber.py - Telechargement et transcription de vocaux WhatsApp (francais)
+audio_transcriber.py - Telechargement et transcription de vocaux WhatsApp (francais) via Evolution API
 """
 
 import logging
 import os
 import re
-
+import base64
 import requests
 from dotenv import load_dotenv
 from google import genai
@@ -15,9 +15,9 @@ load_dotenv()
 
 log = logging.getLogger("audio_transcriber")
 
-GREEN_API_URL = os.getenv("GREEN_API_URL", "https://api.green-api.com").rstrip("/")
-ID_INSTANCE = os.getenv("ID_INSTANCE", "")
-API_TOKEN_INSTANCE = os.getenv("API_TOKEN_INSTANCE", "")
+EVOLUTION_API_URL = os.getenv("EVOLUTION_API_URL", "http://localhost:8085").rstrip("/")
+EVOLUTION_API_KEY = os.getenv("EVOLUTION_API_KEY", "")
+WHATSAPP_INSTANCE = os.getenv("WHATSAPP_INSTANCE", "assistant")
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 TRANSCRIPTION_MODEL = os.getenv("TRANSCRIPTION_MODEL", "gemini-2.5-flash")
@@ -57,30 +57,30 @@ def normalize_mime_type(mime_type: str) -> str:
     return MIME_ALIASES.get(base, base)
 
 
-def _fetch_bytes_from_url(url: str, timeout: int = 60) -> bytes:
-    response = requests.get(url, timeout=timeout)
+def _download_via_evolution_api(message_id: str) -> bytes:
+    if not EVOLUTION_API_KEY or not WHATSAPP_INSTANCE:
+        raise ValueError("EVOLUTION_API_KEY ou WHATSAPP_INSTANCE manquant.")
+
+    url = f"{EVOLUTION_API_URL}/chat/getBase64FromMediaMessage/{WHATSAPP_INSTANCE}"
+    headers = {
+        "apikey": EVOLUTION_API_KEY,
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "message": {
+            "key": {
+                "id": message_id
+            }
+        }
+    }
+    response = requests.post(url, headers=headers, json=payload, timeout=30)
     response.raise_for_status()
-    if not response.content:
-        raise ValueError("Fichier audio vide.")
-    return response.content
-
-
-def _download_via_green_api(chat_id: str, id_message: str) -> str:
-    if not ID_INSTANCE or not API_TOKEN_INSTANCE:
-        raise ValueError("ID_INSTANCE ou API_TOKEN_INSTANCE manquant.")
-
-    url = f"{GREEN_API_URL}/waInstance{ID_INSTANCE}/downloadFile/{API_TOKEN_INSTANCE}"
-    response = requests.post(
-        url,
-        json={"chatId": chat_id, "idMessage": id_message},
-        timeout=30,
-    )
-    response.raise_for_status()
-    payload = response.json()
-    download_url = payload.get("downloadUrl", "")
-    if not download_url:
-        raise ValueError("Green API n'a pas retourne de downloadUrl.")
-    return download_url
+    data = response.json()
+    base64_data = data.get("base64", "")
+    if not base64_data:
+        raise ValueError("Evolution API n'a pas retourne de base64 pour ce fichier audio.")
+    
+    return base64.b64decode(base64_data)
 
 
 def download_voice_file(
@@ -89,25 +89,17 @@ def download_voice_file(
     file_data: dict,
 ) -> tuple[bytes, str]:
     """
-    Telecharge un vocal WhatsApp via l'URL du webhook ou l'API downloadFile.
+    Telecharge un vocal WhatsApp via l'API Evolution.
     Retourne (bytes audio, mime_type normalise).
     """
     mime_type = normalize_mime_type(file_data.get("mimeType", "audio/ogg"))
-    download_url = (file_data.get("downloadUrl") or "").strip()
 
-    if download_url:
-        try:
-            log.info("[AUDIO] Telechargement direct : %s", download_url[:80])
-            return _fetch_bytes_from_url(download_url), mime_type
-        except Exception as exc:
-            log.warning("[AUDIO] Echec telechargement direct : %s", exc)
+    if id_message:
+        log.info("[AUDIO] Telechargement via Evolution API pour idMessage=%s", id_message)
+        audio_bytes = _download_via_evolution_api(id_message)
+        return audio_bytes, mime_type
 
-    if chat_id and id_message:
-        log.info("[AUDIO] Fallback downloadFile pour idMessage=%s", id_message[:16])
-        resolved_url = _download_via_green_api(chat_id, id_message)
-        return _fetch_bytes_from_url(resolved_url), mime_type
-
-    raise ValueError("Impossible de telecharger le fichier audio (URL et idMessage absents).")
+    raise ValueError("Impossible de telecharger le fichier audio (id_message absent).")
 
 
 def transcribe_french_audio(audio_bytes: bytes, mime_type: str) -> str:

@@ -66,49 +66,42 @@ class AgentDecision(BaseModel):
 
 
 SYSTEM_INSTRUCTION_CORE = """
-Tu es un assistant personnel integre a WhatsApp et aux emails.
-Tu reponds TOUJOURS en francais, de maniere concise et professionnelle.
+Tu es un assistant personnel intelligent et chaleureux intégré à WhatsApp et aux e-mails.
+Tu réponds TOUJOURS en français, de manière concise, naturelle et fluide. Évite le ton trop rigide ou robotique.
 
-Regles :
-1. Lis le message entrant (texte ou note vocale transcrite, prefixee [Message vocal]).
-2. Identifie l'intention : question, demande, tache, urgence.
-3. Reponds automatiquement (type "reply") uniquement si ta confiance est elevee.
-4. Escalade (type "escalation") si :
-   - donnees sensibles (banque, mots de passe, comptes personnels)
-   - confiance faible ou ambiguite
-   - action impossible sans validation humaine
-5. Propose une action (type "action") pour les taches executables via API.
-6. Ne pretends JAMAIS qu'une action est faite : le systeme l'executera et confirmera.
+Règles :
+1. Lis le message entrant (texte ou note vocale transcrite, préfixée [Message vocal]).
+2. Identifie l'intention : discussion amicale, question générale, demande de tâche, urgence.
+3. Rends-toi utile ! Réponds de manière autonome (type "reply") à toutes les questions générales, salutations, bavardages ou questions courantes sur ton propriétaire (ex: "il va bien", "que fait-il ?"). Réponds avec bienveillance.
+4. N'escalade (type "escalation") que dans ces cas STRICTS :
+   - Le correspondant demande EXPRESSÉMENT à parler ou laisser un message au propriétaire (ex: "transmets-lui", "je veux lui parler", "dis-lui").
+   - Demande de données sensibles ou hautement confidentielles (mots de passe, comptes, codes secrets, coordonnées bancaires).
+   - Demande d'action ou de rendez-vous complexe nécessitant l'accord direct du propriétaire.
+5. Propose une action (type "action") uniquement pour les tâches exécutables via API (comme envoyer un email ou chercher un contact).
+6. Ne prétends JAMAIS qu'une action est faite : le système l'exécutera et confirmera.
 
 Format de sortie JSON strict (un seul objet) :
-- "reply" : reponse directe au correspondant (champ "message" obligatoire)
-- "escalation" : resume clair de la situation + ce dont le proprietaire a besoin ("message")
-- "action" : champs "service" (whatsapp|gmail|other), "task", "data", et "message" (accuse reception court)
-
-Taches action supportees :
-- gmail / send_email : data {to, subject, body}
-- gmail / read_emails : data {max_results} (optionnel, defaut 5)
-- whatsapp / send_message : data {message, phone} (phone optionnel)
-- other / search_contact : data {name}
+- "reply" : réponse directe et naturelle au correspondant (champ "message" obligatoire)
+- "escalation" : résumé clair de la situation + ce dont le propriétaire a besoin ("message")
+- "action" : champs "service" (whatsapp|gmail|other), "task", "data", et "message" (accusé de réception court)
 """
 
 SYSTEM_INSTRUCTION_OWNER = (
     SYSTEM_INSTRUCTION_CORE
     + """
-Contexte : canal prive avec ton proprietaire.
-Tu peux utiliser les actions gmail et whatsapp pour executer ses demandes.
-Pour les sujets sensibles, prefere "escalation" avec un resume demandant confirmation explicite.
+Contexte : canal privé avec ton propriétaire (Trésor).
+Tu as un accès complet à ses actions (Gmail, WhatsApp, etc.). Exécute ses ordres avec diligence.
 """
 )
 
 SYSTEM_INSTRUCTION_CLIENT = (
     SYSTEM_INSTRUCTION_CORE
     + """
-Contexte : client ou contact externe du proprietaire.
-Tu n'as PAS acces aux emails ni aux outils personnels du proprietaire.
-- Questions simples : "reply"
-- Informations privees, demandes incertaines ou sensibles : "escalation"
-- N'utilise JAMAIS "action" avec service gmail.
+Contexte : canal avec un client, un ami ou un contact externe de ton propriétaire.
+Tu n'as PAS accès aux emails privés ni aux outils personnels du propriétaire.
+- Sois très autonome et amical. Si on te demande "il va bien ?", réponds chaleureusement et directement (ex: "Oui, il va super bien ! Et vous, comment allez-vous ? En quoi puis-je vous aider ?") au lieu de dire que tu transmets la demande.
+- Si le correspondant demande à lui parler ou à lui laisser un message, utilise "escalation" pour notifier ton propriétaire proprement.
+- N'utilise JAMAIS "action" avec le service gmail pour les contacts externes.
 """
 )
 
@@ -132,12 +125,29 @@ def _parse_decision(raw: str) -> AgentDecision:
 
 def get_agent_chat(is_owner: bool = False):
     instruction = SYSTEM_INSTRUCTION_OWNER if is_owner else SYSTEM_INSTRUCTION_CLIENT
+    
+    # Extraire le schéma Pydantic brut sous forme de dictionnaire
+    raw_schema = AgentDecision.model_json_schema()
+    
+    # Nettoyer récursivement le champ additionalProperties pour le SDK Gemini
+    def strip_additional_properties(d):
+        if isinstance(d, dict):
+            d.pop("additionalProperties", None)
+            for k, v in d.items():
+                strip_additional_properties(v)
+        elif isinstance(d, list):
+            for item in d:
+                strip_additional_properties(item)
+                
+    strip_additional_properties(raw_schema)
+
     config = types.GenerateContentConfig(
         system_instruction=instruction,
         response_mime_type="application/json",
-        response_schema=AgentDecision,
+        response_schema=raw_schema,
     )
     return client.chats.create(model=MODEL_NAME, config=config)
+
 
 
 def _get_decision(chat, user_text: str) -> AgentDecision:
@@ -168,7 +178,7 @@ def _notify_owner_escalation(client_chat_id: str, summary: str) -> bool:
     if not owner_phone:
         return False
 
-    client_display = client_chat_id.replace("@c.us", "")
+    client_display = client_chat_id.replace("@c.us", "").replace("@s.whatsapp.net", "")
     owner_message = (
         "--- ESCALADE ASSISTANT ---\n"
         f"Client : {client_display}\n"
@@ -288,7 +298,7 @@ def handle_message(chat, user_text: str, chat_id: str, is_owner: bool) -> str:
             decision = AgentDecision(
                 type="escalation",
                 message=(
-                    f"Le client {chat_id.replace('@c.us', '')} demande une action email : "
+                    f"Le client {chat_id.replace('@c.us', '').replace('@s.whatsapp.net', '')} demande une action email : "
                     f"{decision.task}. Message : {user_text[:200]}"
                 ),
             )
@@ -302,8 +312,8 @@ def ask_agent(chat, user_text: str) -> str:
     chat_id = active_client_chat_id.get() or os.getenv("OWNER_PHONE", "")
     is_owner = True
     owner_chat = os.getenv("OWNER_PHONE", "").strip().replace("+", "").replace(" ", "")
-    if owner_chat and "@c.us" not in owner_chat:
-        owner_chat = f"{owner_chat}@c.us"
+    if owner_chat and "@c.us" not in owner_chat and "@s.whatsapp.net" not in owner_chat:
+        owner_chat = f"{owner_chat}@s.whatsapp.net"
     if chat_id and owner_chat:
         is_owner = chat_id == owner_chat
     return handle_message(chat, user_text, chat_id or owner_chat, is_owner)

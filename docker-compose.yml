@@ -16,11 +16,14 @@ services:
       - ./credentials.json:/app/credentials.json
     environment:
       - PORT=8000
+      - EVOLUTION_API_URL=http://evolution-api:8080
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/"]
       interval: 30s
       timeout: 10s
       retries: 3
+    depends_on:
+      - evolution-api
 
   # -------------------------------------------------------------
   # 2. Agent Scheduler: Automated Gmail Polling & Daily Summaries
@@ -33,4 +36,51 @@ services:
       - ./.env:/app/.env
       - ./token.json:/app/token.json
       - ./credentials.json:/app/credentials.json
+    environment:
+      - EVOLUTION_API_URL=http://evolution-api:8080
     command: ["python", "main.py", "--schedule"]
+    depends_on:
+      - evolution-api
+
+  # -------------------------------------------------------------
+  # 3. Evolution API: Private WhatsApp Gateway
+  # -------------------------------------------------------------
+  evolution-api:
+    image: evoapicloud/evolution-api:latest
+    container_name: evolution-api
+    restart: unless-stopped
+    ports:
+      - "8085:8080"
+    environment:
+      - SERVER_URL=http://localhost:8085
+      - SERVER_TYPE=http
+      - AUTHENTICATION_API_KEY=c3b35df3620042eebb7fc4ab0e5531a7664669959e03490d99
+      - DATABASE_ENABLED=true
+      - DATABASE_PROVIDER=postgresql
+      - DATABASE_CONNECTION_URI=postgresql://postgres:postgres@db:5432/evolution
+      - WEBHOOK_GLOBAL_ENABLED=true
+      - WEBHOOK_GLOBAL_URL=http://agent-webhook:8000/webhook
+      - WEBHOOK_EVENTS_APPLICATION_JSON=true
+      - WEBHOOK_EVENTS_ERRORS=true
+      - WEBHOOK_EVENTS_MESSAGES_UPSERT=true
+      - CACHE_REDIS_ENABLED=false
+      - CACHE_LOCAL_ENABLED=true
+    depends_on:
+      - db
+
+  # -------------------------------------------------------------
+  # 4. Postgres DB: Backing Database for Evolution API
+  # -------------------------------------------------------------
+  db:
+    image: postgres:15-alpine
+    container_name: evolution-db
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=evolution
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+volumes:
+  pgdata:

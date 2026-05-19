@@ -1,5 +1,5 @@
 """
-webhook.py - Serveur FastAPI pour recevoir les messages WhatsApp via Green API
+webhook.py - Serveur FastAPI pour recevoir les messages WhatsApp via Evolution API
 """
 
 import os
@@ -21,7 +21,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("webhook")
 
-app = FastAPI(title="AI Agent WhatsApp Webhook")
+app = FastAPI(title="AI Agent WhatsApp Webhook (Evolution API)")
 
 # Memoire en RAM : { "chatId": session_gemini }
 user_sessions = {}
@@ -29,28 +29,20 @@ user_sessions = {}
 # Ensemble des chatId deja en cours de traitement (anti boucle infinie)
 processing_set = set()
 
-# Le chatId de l'instance elle-meme pour ignorer ses propres messages sortants
-OWN_PHONE = os.getenv("PHONE_NUMBER", "")
 # Le chatId du proprietaire de l'assistant (qui a les privileges)
 OWNER_PHONE = os.getenv("OWNER_PHONE", "")
-
-
-def get_own_chat_id() -> str:
-    """Retourne le chatId de l'instance pour filtrer ses propres messages."""
-    phone = OWN_PHONE.strip().replace("+", "").replace(" ", "")
-    return f"{phone}@c.us"
 
 
 def get_owner_chat_id() -> str:
     """Retourne le chatId du proprietaire pour detecter ses messages."""
     phone = OWNER_PHONE.strip().replace("+", "").replace(" ", "")
-    if "@c.us" not in phone:
-        phone = f"{phone}@c.us"
+    if "@s.whatsapp.net" not in phone:
+        phone = f"{phone}@s.whatsapp.net"
     return phone
 
 
 def _run_agent_for_chat(chat_id: str, text: str):
-    """Execute l'agent et envoie la reponse (sans gestion du verrou)."""
+    """Execute l'agent et envoie la reponse."""
     is_owner = chat_id == get_owner_chat_id()
 
     if chat_id not in user_sessions:
@@ -126,76 +118,71 @@ def process_whatsapp_message(chat_id: str, text: str):
 
 
 @app.post("/webhook")
-async def green_api_webhook(request: Request, background_tasks: BackgroundTasks):
+async def evolution_api_webhook(request: Request, background_tasks: BackgroundTasks):
     """
-    Endpoint appele par Green API a chaque evenement.
+    Endpoint appele par Evolution API a chaque evenement.
     """
     try:
         payload = await request.json()
-        webhook_type = payload.get("typeWebhook", "")
+        event_type = payload.get("event", "")
 
-        # Logguer tous les types d'evenements pour le debug
-        log.info(f"[WEBHOOK] type={webhook_type}")
+        # Logguer le type d'evenement pour le debug
+        log.info(f"[WEBHOOK] event={event_type}")
 
-        # On traite uniquement les messages entrants (de quelqu'un d'autre)
-        # et les messages sortants quand l'utilisateur parle au bot depuis son propre appareil
-        if webhook_type not in ["incomingMessageReceived", "outgoingMessageReceived"]:
-            return {"status": "ignored", "reason": webhook_type}
+        # On traite uniquement les messages.upsert
+        if event_type != "messages.upsert":
+            return {"status": "ignored", "reason": f"unhandled_event_{event_type}"}
 
-        sender_data = payload.get("senderData", {})
-        chat_id = sender_data.get("chatId", "")
-        sender_id = sender_data.get("sender", "")
+        data = payload.get("data", {})
+        if not data:
+            return {"status": "ignored", "reason": "empty_data"}
 
-        # 1. Ignorer les statuts
+        key = data.get("key", {})
+        chat_id = key.get("remoteJid", "")
+        message_id = key.get("id", "")
+        from_me = key.get("fromMe", False)
+
+        # 1. Ignorer les messages sortants (sauf si c'est une discussion avec soi-meme)
+        if from_me:
+            # On ignore pour eviter de repondre a nos propres messages
+            log.info(f"[SKIP] Message sortant (fromMe=True), ignore.")
+            return {"status": "ignored", "reason": "bot_message"}
+
+        # 2. Ignorer les statuts
         if "status@broadcast" in chat_id:
             return {"status": "ignored", "reason": "status"}
 
-        # 2. Ignorer STRICTEMENT les groupes
+        # 3. Ignorer STRICTEMENT les groupes
         if chat_id.endswith("@g.us"):
             log.info(f"[SKIP] Message de groupe ({chat_id}) ignore.")
             return {"status": "ignored", "reason": "group_message"}
 
-        # 3. Anti-boucle : ignorer les messages envoyes par l'instance elle-meme (sauf si c'est la discussion avec soi-meme)
-        # Green API met le numero de l'instance dans "sender" avec ":0" parfois
-        own_id = get_own_chat_id()
-        if chat_id != own_id:
-            if sender_id and sender_id.startswith(own_id.replace("@c.us", "")):
-                log.info(f"[SKIP] Message envoye par l'instance elle-meme ({sender_id}), ignore.")
-                return {"status": "ignored", "reason": "own_message"}
+        # Extraire le message
+        message = data.get("message", {})
+        if not message:
+            return {"status": "ignored", "reason": "no_message_content"}
 
-        # Extraire le texte du message
-        message_data = payload.get("messageData", {})
-        type_message = message_data.get("typeMessage", "")
+        message_type = data.get("messageType", "")
         text = ""
 
-        if type_message == "textMessage":
-            text = message_data.get("textMessageData", {}).get("textMessage", "")
-        elif type_message == "extendedTextMessage":
-            text = message_data.get("extendedTextMessageData", {}).get("text", "")
-        elif type_message == "audioMessage":
-            file_data = message_data.get("fileMessageData") or message_data.get(
-                "audioMessageData", {}
+        # Recuperer le texte selon le type de message
+        if "conversation" in message:
+            text = message.get("conversation", "")
+        elif "extendedTextMessage" in message:
+            text = message.get("extendedTextMessage", {}).get("text", "")
+        elif "audioMessage" in message:
+            audio_data = message.get("audioMessage", {})
+            file_data = {
+                "mimeType": audio_data.get("mimetype", "audio/ogg"),
+            }
+            log.info(f"[AUDIO] Vocal recu de {chat_id}, transcription en arriere-plan")
+            background_tasks.add_task(
+                process_whatsapp_voice, chat_id, message_id, file_data
             )
-            id_message = payload.get("idMessage", "")
-            caption = (file_data.get("caption") or "").strip()
-
-            if caption:
-                text = caption
-            elif file_data.get("downloadUrl") or id_message:
-                log.info(f"[AUDIO] Vocal recu de {chat_id}, transcription en arriere-plan")
-                background_tasks.add_task(
-                    process_whatsapp_voice, chat_id, id_message, file_data
-                )
-                return {"status": "processing", "detail": "voice_transcription"}
-            else:
-                send_message(
-                    "Message vocal recu, mais je ne peux pas le telecharger. Reessayez.",
-                    phone=chat_id,
-                )
-                return {"status": "ignored", "reason": "audio_missing_url"}
+            return {"status": "processing", "detail": "voice_transcription"}
 
         if not text:
-            log.info(f"[SKIP] Pas de texte (typeMessage={type_message})")
+            log.info(f"[SKIP] Pas de texte ou type de message non supporte (messageType={message_type})")
             return {"status": "ignored", "reason": "no_text"}
 
         # 4. Traiter les commandes speciales du proprietaire (Owner)
@@ -209,15 +196,16 @@ async def green_api_webhook(request: Request, background_tasks: BackgroundTasks)
                         target_client = parts[0].strip()
                         reply_content = parts[1].strip()
                         
-                        if not target_client.endswith("@c.us"):
-                            target_client = f"{target_client}@c.us"
+                        if not target_client.endswith("@s.whatsapp.net"):
+                            target_client = f"{target_client}@s.whatsapp.net"
                         
                         log.info(f"[OWNER CMD] Reponse manuelle transmise a {target_client} : {reply_content[:50]}...")
                         
                         # Envoyer la reponse au client
                         send_message(reply_content, phone=target_client)
                         # Confirmer au proprietaire
-                        send_message(f"Reponse bien transmise au client {target_client.replace('@c.us', '')} !", phone=owner_id)
+                        display_phone = target_client.replace('@s.whatsapp.net', '')
+                        send_message(f"Reponse bien transmise au client {display_phone} !", phone=owner_id)
                         return {"status": "success", "detail": "reply_sent"}
                 except Exception as ex:
                     log.error(f"Erreur lors de l'execution de /repondre : {ex}")
@@ -232,17 +220,12 @@ async def green_api_webhook(request: Request, background_tasks: BackgroundTasks)
 
     except Exception as e:
         log.error(f"[ERROR] Webhook : {e}", exc_info=True)
-        try:
-            raw = await request.body()
-            log.error(f"[RAW PAYLOAD] {raw.decode()}")
-        except Exception:
-            pass
         return {"status": "error", "message": str(e)}
 
 
 @app.get("/")
 def home():
-    return {"status": "running", "service": "AI Agent WhatsApp Webhook"}
+    return {"status": "running", "service": "AI Agent WhatsApp Webhook (Evolution API)"}
 
 
 if __name__ == "__main__":

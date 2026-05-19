@@ -1,5 +1,5 @@
 """
-whatsapp_sender.py - Module d'envoi WhatsApp via Green API
+whatsapp_sender.py - Module d'envoi WhatsApp via Evolution API
 """
 
 import os
@@ -8,75 +8,80 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-GREEN_API_URL = os.getenv("GREEN_API_URL", "https://api.green-api.com").rstrip("/")
-ID_INSTANCE = os.getenv("ID_INSTANCE", "")
-API_TOKEN_INSTANCE = os.getenv("API_TOKEN_INSTANCE", "")
+EVOLUTION_API_URL = os.getenv("EVOLUTION_API_URL", "http://localhost:8085").rstrip("/")
+EVOLUTION_API_KEY = os.getenv("EVOLUTION_API_KEY", "")
+WHATSAPP_INSTANCE = os.getenv("WHATSAPP_INSTANCE", "assistant")
 PHONE_NUMBER = os.getenv("PHONE_NUMBER", "")
 
 
 def _validate_config():
     missing = []
     for var_name, var_val in [
-        ("ID_INSTANCE", ID_INSTANCE),
-        ("API_TOKEN_INSTANCE", API_TOKEN_INSTANCE),
+        ("EVOLUTION_API_URL", EVOLUTION_API_URL),
+        ("EVOLUTION_API_KEY", EVOLUTION_API_KEY),
+        ("WHATSAPP_INSTANCE", WHATSAPP_INSTANCE),
         ("PHONE_NUMBER", PHONE_NUMBER),
     ]:
         if not var_val:
             missing.append(var_name)
     if missing:
-        raise ValueError(f"Config WhatsApp incomplete. Manque: {', '.join(missing)}")
+        raise ValueError(f"Config WhatsApp Evolution API incomplete. Manque: {', '.join(missing)}")
 
 
 def _format_phone(phone: str) -> str:
     """
-    Formate un numero de telephone au format chatId de Green API.
-    Si le phone contient deja un '@', il est retourne tel quel.
+    Formate un numero de telephone au format attendu par Evolution API.
+    L'API Evolution attend le numero brut avec code pays (ex: 22897050981).
     """
     phone = phone.strip()
-    if "@" in phone:
-        return phone
-    cleaned = phone.replace(" ", "").replace("-", "").replace("+", "")
-    return f"{cleaned}@c.us"
+    # Nettoyer les suffixes et prefixes
+    cleaned = phone.replace("@c.us", "").replace("@s.whatsapp.net", "")
+    cleaned = cleaned.replace(" ", "").replace("-", "").replace("+", "")
+    return cleaned
 
 
 def check_connection() -> bool:
     _validate_config()
     try:
-        url = f"{GREEN_API_URL}/waInstance{ID_INSTANCE}/getStateInstance/{API_TOKEN_INSTANCE}"
-        resp = requests.get(url, timeout=10)
+        url = f"{EVOLUTION_API_URL}/instance/connectionState/{WHATSAPP_INSTANCE}"
+        headers = {"apikey": EVOLUTION_API_KEY}
+        resp = requests.get(url, headers=headers, timeout=10)
         resp.raise_for_status()
-        state = resp.json().get("stateInstance", "")
-        if state == "authorized":
-            print("WhatsApp connecte (Green API).")
+        state = resp.json().get("instance", {}).get("state", "")
+        if state in ("open", "connected"):
+            print("WhatsApp connecte (Evolution API).")
             return True
         print(f"WhatsApp non connecte. Etat: {state}")
         return False
     except requests.exceptions.RequestException as e:
-        print(f"Erreur connexion Green API : {e}")
+        print(f"Erreur connexion Evolution API : {e}")
         return False
 
 
 def send_message(message: str, phone: str = None) -> bool:
     _validate_config()
     target = phone or PHONE_NUMBER
-    chat_id = _format_phone(target)
+    cleaned_phone = _format_phone(target)
 
     if len(message) > 4000:
         message = message[:3950] + "\n\n[Message tronque]"
 
-    print(f"[SEND] -> chatId={chat_id} | msg={message[:60]}...")
+    print(f"[SEND] -> phone={cleaned_phone} | msg={message[:60]}...")
     try:
-        url = f"{GREEN_API_URL}/waInstance{ID_INSTANCE}/sendMessage/{API_TOKEN_INSTANCE}"
-        payload = {"chatId": chat_id, "message": message}
-        resp = requests.post(url, json=payload, timeout=30)
+        url = f"{EVOLUTION_API_URL}/message/sendText/{WHATSAPP_INSTANCE}"
+        headers = {
+            "apikey": EVOLUTION_API_KEY,
+            "Content-Type": "application/json"
+        }
+        payload = {"number": cleaned_phone, "text": message}
+        resp = requests.post(url, headers=headers, json=payload, timeout=30)
         resp.raise_for_status()
-        msg_id = resp.json().get("idMessage", "?")
-        print(f"[SEND OK] idMessage={msg_id}")
+        print(f"[SEND OK]")
         return True
     except requests.exceptions.Timeout:
-        print("Erreur: Timeout - Green API ne repond pas.")
+        print("Erreur: Timeout - Evolution API ne repond pas.")
     except requests.exceptions.ConnectionError:
-        print(f"Erreur: Impossible de se connecter a {GREEN_API_URL}")
+        print(f"Erreur: Impossible de se connecter a {EVOLUTION_API_URL}")
     except requests.exceptions.HTTPError as e:
         print(f"Erreur HTTP {e.response.status_code}: {e.response.text}")
     except Exception as e:
@@ -91,10 +96,10 @@ def send_summary(summary: str) -> bool:
 
 
 if __name__ == "__main__":
-    print("Test WhatsApp Sender")
+    print("Test WhatsApp Sender (Evolution API)")
     try:
         _validate_config()
         if check_connection():
-            send_message("Test AI Assistant - config OK !")
+            send_message("Test AI Assistant - Evolution API config OK !")
     except ValueError as e:
         print(e)
